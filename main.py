@@ -1,8 +1,4 @@
-import os
-import re
-import time
-import sqlite3
-import asyncio
+import os, re, time, sqlite3, asyncio
 from dataclasses import dataclass
 from typing import Optional, Dict, Tuple, List
 
@@ -10,18 +6,9 @@ import httpx
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
-from telegram import (
-    Update,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-)
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 load_dotenv()
 
@@ -37,172 +24,129 @@ if not BOT_TOKEN:
 if not ADMIN_IDS:
     raise RuntimeError("Missing ADMIN_IDS")
 
-
-@dataclass
-class GameSource:
-    key: str
-    name: str
-    url: str
-    base: str
-    link_regex: re.Pattern
-
-
-# SOURCES (some sites block scraping sometimes; this bot will show the real error in panel)
-GAMES: Dict[str, GameSource] = {
-    "deltaforce": GameSource(
-        key="deltaforce",
-        name="Delta Force Mobile",
-        url="https://deltaforce.garena.com/en/news/all",
-        base="https://deltaforce.garena.com",
-        link_regex=re.compile(r"/en/news/"),
-    ),
-    "8ball": GameSource(
-        key="8ball",
-        name="8 Ball Pool Mobile",
-        url="https://www.8ballpool.com/en/news",
-        base="https://www.8ballpool.com",
-        link_regex=re.compile(r"^/en/news/"),
-    ),
-    "arenabreakout": GameSource(
-        key="arenabreakout",
-        name="Arena Breakout Mobile",
-        url="https://arenabreakout.com/web202210/news/notice.html",
-        base="https://arenabreakout.com",
-        link_regex=re.compile(r"/web202210/news/"),
-    ),
-    "mlbb": GameSource(
-        key="mlbb",
-        name="Mobile Legends: Bang Bang",
-        url="https://www.mobilelegends.com/news",
-        base="https://www.mobilelegends.com",
-        link_regex=re.compile(r"/news/"),
-    ),
-    "freefire": GameSource(
-        key="freefire",
-        name="Free Fire Mobile",
-        url="https://ff.garena.com/en/news/",
-        base="https://ff.garena.com",
-        link_regex=re.compile(r"/en/|/article/|/news/"),
-    ),
-    "codm": GameSource(
-        key="codm",
-        name="Call of Duty Mobile",
-        url="https://www.callofduty.com/blog/mobile",
-        base="https://www.callofduty.com",
-        link_regex=re.compile(r"/blog/"),
-    ),
-    "bloodstrike": GameSource(
-        key="bloodstrike",
-        name="BloodStrike Mobile",
-        url="https://www.blood-strike.com/m/news/",
-        base="https://www.blood-strike.com",
-        link_regex=re.compile(r"/news/|/update/"),
-    ),
-}
-
-# Patch/update keyword prioritization
+# Patch/update keywords
 PATCH_KEYWORDS = [
     "patch", "patch notes", "update", "version", "hotfix", "bug fix", "bugfix",
-    "maintenance", "optimisation", "optimization", "season", "ob", "balance"
+    "maintenance", "optimization", "optimisation", "season", "balance", "system upgrades",
+    "release notes", "client update", "major update"
 ]
 
+# Strip ALL links from output
+URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
 
-# ----------------------------
-# DB
-# ----------------------------
+
+def strip_links(text: str) -> str:
+    if not text:
+        return ""
+    text = URL_RE.sub("", text)
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    return text
+
+
+def has_patch_kw(title: str) -> bool:
+    t = (title or "").lower()
+    return any(k in t for k in PATCH_KEYWORDS)
+
+
+# ---------- DB ----------
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_FILE)
     conn.execute("PRAGMA journal_mode=WAL;")
     return conn
 
+
 def init_db():
     with db() as conn:
         conn.execute("""
-        CREATE TABLE IF NOT EXISTS topic_map (
-            game_key TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS bindings (
             chat_id INTEGER NOT NULL,
             thread_id INTEGER NOT NULL,
+            game_key TEXT NOT NULL,
             enabled INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY (game_key, chat_id, thread_id)
+            PRIMARY KEY(chat_id, thread_id)
         )
         """)
         conn.execute("""
         CREATE TABLE IF NOT EXISTS last_seen (
             game_key TEXT PRIMARY KEY,
-            last_url TEXT,
+            last_id TEXT,
             last_title TEXT,
             last_ts INTEGER
         )
         """)
 
-def set_topic_binding(game_key: str, chat_id: int, thread_id: int, enabled: int = 1):
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def ctx_ids(update: Update) -> Tuple[int, int]:
+    chat_id = update.effective_chat.id
+    msg = update.effective_message
+    if msg and getattr(msg, "is_topic_message", False) and msg.message_thread_id:
+        return chat_id, int(msg.message_thread_id)
+    return chat_id, 0  # 0 means no topic thread (channels/normal groups)
+
+
+def set_binding(chat_id: int, thread_id: int, game_key: str, enabled: int = 1):
     with db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO topic_map(game_key, chat_id, thread_id, enabled) VALUES (?,?,?,?)",
-            (game_key, chat_id, thread_id, enabled)
+            "INSERT OR REPLACE INTO bindings(chat_id, thread_id, game_key, enabled) VALUES (?,?,?,?)",
+            (chat_id, thread_id, game_key, enabled)
         )
 
-def get_binding(game_key: str, chat_id: int, thread_id: int) -> Optional[int]:
+
+def get_binding(chat_id: int, thread_id: int) -> Optional[Tuple[str, int]]:
     with db() as conn:
         row = conn.execute(
-            "SELECT enabled FROM topic_map WHERE game_key=? AND chat_id=? AND thread_id=?",
-            (game_key, chat_id, thread_id)
+            "SELECT game_key, enabled FROM bindings WHERE chat_id=? AND thread_id=?",
+            (chat_id, thread_id)
         ).fetchone()
-    return int(row[0]) if row else None
+    if not row:
+        return None
+    return str(row[0]), int(row[1])
 
-def get_bound_targets(game_key: str) -> List[Tuple[int, int, int]]:
+
+def toggle_enabled(chat_id: int, thread_id: int) -> Optional[int]:
+    cur = get_binding(chat_id, thread_id)
+    if not cur:
+        return None
+    g, enabled = cur
+    new_enabled = 0 if enabled == 1 else 1
+    set_binding(chat_id, thread_id, g, new_enabled)
+    return new_enabled
+
+
+def all_bindings() -> List[Tuple[int, int, str, int]]:
     with db() as conn:
-        rows = conn.execute(
-            "SELECT chat_id, thread_id, enabled FROM topic_map WHERE game_key=?",
-            (game_key,)
-        ).fetchall()
-    return [(int(r[0]), int(r[1]), int(r[2])) for r in rows]
+        rows = conn.execute("SELECT chat_id, thread_id, game_key, enabled FROM bindings").fetchall()
+    return [(int(r[0]), int(r[1]), str(r[2]), int(r[3])) for r in rows]
+
 
 def get_last_seen(game_key: str) -> Optional[str]:
     with db() as conn:
-        row = conn.execute("SELECT last_url FROM last_seen WHERE game_key=?", (game_key,)).fetchone()
+        row = conn.execute("SELECT last_id FROM last_seen WHERE game_key=?", (game_key,)).fetchone()
     return row[0] if row else None
 
-def update_last_seen(game_key: str, title: str, url: str):
+
+def set_last_seen(game_key: str, item_id: str, title: str):
     with db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO last_seen(game_key, last_url, last_title, last_ts) VALUES (?,?,?,?)",
-            (game_key, url, title, int(time.time()))
+            "INSERT OR REPLACE INTO last_seen(game_key, last_id, last_title, last_ts) VALUES (?,?,?,?)",
+            (game_key, item_id, title, int(time.time()))
         )
 
 
-# ----------------------------
-# Helpers
-# ----------------------------
+# ---------- HTTP ----------
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
 }
 
-def escape_html(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-         .replace("<", "&lt;")
-         .replace(">", "&gt;")
-    )
-
-def absolutize(base: str, href: str) -> str:
-    if href.startswith("http://") or href.startswith("https://"):
-        return href
-    if href.startswith("/"):
-        return base.rstrip("/") + href
-    return base.rstrip("/") + "/" + href
-
-def contains_patch_keywords(title: str) -> bool:
-    t = title.lower()
-    return any(k in t for k in PATCH_KEYWORDS)
-
 async def http_get(url: str) -> httpx.Response:
-    last_err = None
+    last = None
     for _ in range(3):
         try:
             async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=HEADERS) as client:
@@ -210,123 +154,230 @@ async def http_get(url: str) -> httpx.Response:
                 r.raise_for_status()
                 return r
         except Exception as e:
-            last_err = e
+            last = e
             await asyncio.sleep(2)
-    raise last_err
+    raise last
 
 
-# ----------------------------
-# Scraping list page -> pick best "patch/update" candidate
-# ----------------------------
-def extract_candidates(html: str, source: GameSource) -> List[Tuple[str, str]]:
-    soup = BeautifulSoup(html, "html.parser")
-    out: List[Tuple[str, str]] = []
+# ---------- Sources ----------
+@dataclass
+class Source:
+    type: str  # "youtube" or "web"
+    feed_or_url: str
+    base: str = ""  # for web
+    link_regex: Optional[re.Pattern] = None
 
+
+# Official socials approach:
+# - Most games: Official YouTube RSS (thumbnail + description) -> NO links in output
+# - CODM: official blog (better patch notes) but we still send NO links
+
+SOURCES: Dict[str, Source] = {
+    # YouTube RSS format: https://www.youtube.com/feeds/videos.xml?channel_id=CHANNEL_ID
+    "deltaforce": Source(type="youtube", feed_or_url="https://www.youtube.com/feeds/videos.xml?channel_id=UC82GZluB0OeupPB4FNUuYEg"),
+    "arenabreakout": Source(type="youtube", feed_or_url="https://www.youtube.com/feeds/videos.xml?channel_id=UCSrq2wtp-DB6blBl4dRuzbw"),
+    "mlbb": Source(type="youtube", feed_or_url="https://www.youtube.com/feeds/videos.xml?channel_id=UCqmld-BIYME2i_ooRTo1EOg"),
+    "bloodstrike": Source(type="youtube", feed_or_url="https://www.youtube.com/feeds/videos.xml?channel_id=UC5ORZ2u9JoiGe9bp-cjxPIg"),
+
+    # 8 Ball Pool: official site is mostly news/events; still best available without APIs
+    "8ball": Source(
+        type="web",
+        feed_or_url="https://www.8ballpool.com/en/news",
+        base="https://www.8ballpool.com",
+        link_regex=re.compile(r"^/en/news/")
+    ),
+
+    # Free Fire: official site posts patch notes regularly
+    "freefire": Source(
+        type="web",
+        feed_or_url="https://ff.garena.com/en/news/",
+        base="https://ff.garena.com",
+        link_regex=re.compile(r"/en/|/article/|/news/")
+    ),
+
+    # CODM: official mobile blog page (fix weird /content/... internally; we don't send links anyway)
+    "codm": Source(
+        type="web",
+        feed_or_url="https://www.callofduty.com/blog/mobile",
+        base="https://www.callofduty.com",
+        link_regex=re.compile(r"/blog/")
+    ),
+}
+
+GAME_NAMES = {
+    "deltaforce": "Delta Force Mobile",
+    "8ball": "8 Ball Pool Mobile",
+    "arenabreakout": "Arena Breakout Mobile",
+    "mlbb": "Mobile Legends: Bang Bang",
+    "freefire": "Free Fire Mobile",
+    "codm": "Call of Duty Mobile",
+    "bloodstrike": "BloodStrike Mobile",
+}
+
+VALID_GAMES = list(GAME_NAMES.keys())
+
+
+# ---------- Fetch latest patch/update (returns media_url, title, description, unique_id) ----------
+async def fetch_latest_patch(game_key: str) -> Optional[Tuple[Optional[str], str, str, str]]:
+    src = SOURCES[game_key]
+
+    if src.type == "youtube":
+        r = await http_get(src.feed_or_url)
+        xml = r.text
+
+        # Parse feed with BeautifulSoup (XML mode)
+        soup = BeautifulSoup(xml, "xml")
+        entries = soup.find_all("entry")
+        if not entries:
+            return None
+
+        # Prefer patch/update-like entries first
+        def entry_title(e) -> str:
+            t = e.find("title")
+            return t.get_text(strip=True) if t else ""
+
+        patch_entries = [e for e in entries if has_patch_kw(entry_title(e))]
+        chosen = patch_entries[0] if patch_entries else entries[0]
+
+        title = entry_title(chosen)
+
+        # Description: YouTube provides media:group/description
+        desc_tag = chosen.find("media:description") or chosen.find("content")
+        desc = desc_tag.get_text(" ", strip=True) if desc_tag else ""
+        desc = strip_links(desc)
+
+        # Thumbnail
+        thumb = chosen.find("media:thumbnail")
+        media_url = thumb["url"].strip() if thumb and thumb.get("url") else None
+
+        # Unique id
+        vid_id = chosen.find("yt:videoId")
+        unique = (vid_id.get_text(strip=True) if vid_id else title) or title
+
+        return media_url, title, desc, unique
+
+    # web scraping
+    list_r = await http_get(src.feed_or_url)
+    soup = BeautifulSoup(list_r.text, "html.parser")
+
+    candidates = []
     for a in soup.find_all("a", href=True):
         href = (a.get("href") or "").strip()
         if not href:
             continue
-        if not source.link_regex.search(href):
+        if src.link_regex and not src.link_regex.search(href):
             continue
-
-        url = absolutize(source.base, href)
         title = (a.get_text(" ", strip=True) or a.get("title") or a.get("aria-label") or "").strip()
         title = re.sub(r"\s+", " ", title)
-
-        # basic quality filter
         if len(title) < 6:
             continue
-        if any(bad in title.lower() for bad in ["read more", "view more", "learn more"]):
-            continue
 
-        out.append((title, url))
+        url = href
+        if href.startswith("/"):
+            url = src.base.rstrip("/") + href
 
-    # de-dup by URL keep first occurrence
+        candidates.append((title, url))
+
+    # de-dup
     seen = set()
     uniq = []
-    for t, u in out:
+    for t, u in candidates:
         if u in seen:
             continue
         seen.add(u)
         uniq.append((t, u))
-    return uniq
 
-def pick_best_candidate(candidates: List[Tuple[str, str]]) -> Optional[Tuple[str, str]]:
-    if not candidates:
-        return None
-    # Prefer patch/update titles first
-    patch_first = [c for c in candidates if contains_patch_keywords(c[0])]
-    return patch_first[0] if patch_first else candidates[0]
-
-
-# ----------------------------
-# Article page -> OG meta for media + desc
-# ----------------------------
-def parse_article_meta(article_html: str, fallback_title: str, fallback_url: str) -> Tuple[str, str, Optional[str], str]:
-    soup = BeautifulSoup(article_html, "html.parser")
-
-    def meta(prop: str) -> Optional[str]:
-        tag = soup.find("meta", attrs={"property": prop})
-        if tag and tag.get("content"):
-            return tag["content"].strip()
-        tag = soup.find("meta", attrs={"name": prop})
-        if tag and tag.get("content"):
-            return tag["content"].strip()
+    if not uniq:
         return None
 
-    title = meta("og:title") or meta("twitter:title") or fallback_title
-    desc = meta("og:description") or meta("description") or meta("twitter:description") or ""
-    img = meta("og:image") or meta("twitter:image")
-    url = meta("og:url") or fallback_url
+    # prefer patch/update candidates first
+    patch_first = [c for c in uniq if has_patch_kw(c[0])]
+    title, article_url = patch_first[0] if patch_first else uniq[0]
 
-    desc = re.sub(r"\s+", " ", desc).strip()
-    if len(desc) > 220:
-        desc = desc[:217] + "..."
-
-    return title, url, img, desc
-
-
-async def fetch_latest_patchlike(source: GameSource) -> Optional[Tuple[str, str, Optional[str], str]]:
-    """
-    Returns: (title, url, image_url_or_none, desc)
-    Picks a "patch/update" looking post first, otherwise falls back to newest.
-    """
-    list_resp = await http_get(source.url)
-    candidates = extract_candidates(list_resp.text, source)
-    best = pick_best_candidate(candidates)
-    if not best:
-        return None
-
-    fallback_title, article_url = best
-
+    # fetch article
     try:
-        art_resp = await http_get(article_url)
-        title, url, img, desc = parse_article_meta(art_resp.text, fallback_title, article_url)
-        return title, url, img, desc
+        art_r = await http_get(article_url)
+        art_soup = BeautifulSoup(art_r.text, "html.parser")
+
+        # canonical (fix CODM internal weird URLs)
+        canonical = None
+        canon_tag = art_soup.find("link", rel=lambda x: x and "canonical" in x)
+        if canon_tag and canon_tag.get("href"):
+            canonical = canon_tag["href"].strip()
+
+        # OG image
+        og_img = None
+        og = art_soup.find("meta", attrs={"property": "og:image"})
+        if og and og.get("content"):
+            og_img = og["content"].strip()
+
+        # Full-ish description: collect paragraphs
+        # Try <article> first; else fallback to all <p>
+        text_parts = []
+        article_tag = art_soup.find("article")
+        p_tags = (article_tag.find_all("p") if article_tag else art_soup.find_all("p"))
+        for p in p_tags:
+            txt = p.get_text(" ", strip=True)
+            txt = strip_links(txt)
+            if txt and len(txt) > 20:
+                text_parts.append(txt)
+
+        # de-dup lines
+        seen_lines = set()
+        cleaned = []
+        for line in text_parts:
+            key = line.lower()
+            if key in seen_lines:
+                continue
+            seen_lines.add(key)
+            cleaned.append(line)
+
+        desc = "\n\n".join(cleaned).strip()
+        if not desc:
+            # fallback: meta description
+            md = art_soup.find("meta", attrs={"name": "description"})
+            if md and md.get("content"):
+                desc = strip_links(md["content"].strip())
+
+        # Telegram caption limit ~1024 for photo captions; keep safe
+        if len(desc) > 900:
+            desc = desc[:900].rstrip() + "..."
+
+        unique_id = canonical or str(art_r.url) or article_url
+        return og_img, title, desc, unique_id
+
     except Exception:
-        return fallback_title, article_url, None, ""
+        # fallback with no description
+        return None, title, "", article_url
 
 
-# ----------------------------
-# Sending (media + words + footer)
-# ----------------------------
-async def send_update_media(bot, chat_id: int, thread_id: Optional[int], game: GameSource,
-                            title: str, url: str, img: Optional[str], desc: str):
-    caption_lines = [
-        f"🛠️ <b>{escape_html(game.name)} — Update / Patch</b>",
-        f"<b>{escape_html(title)}</b>",
-    ]
-    if desc:
-        caption_lines.append(escape_html(desc))
-    caption_lines.append(escape_html(url))
-    caption = "\n".join(caption_lines) + FOOTER
+# ---------- Send (NO LINKS) ----------
+async def send_patch(bot, chat_id: int, thread_id: int, game_key: str,
+                     media_url: Optional[str], title: str, desc: str):
+    thread = None if thread_id == 0 else thread_id
+    game_name = GAME_NAMES[game_key]
 
-    if img:
+    # Make message no-links
+    title_clean = strip_links(title)
+    desc_clean = strip_links(desc)
+
+    # Build text
+    body = f"🛠️ <b>{game_name} — Update / Patch</b>\n<b>{title_clean}</b>"
+    if desc_clean:
+        body += f"\n\n{desc_clean}"
+    body += FOOTER
+
+    # Use media if possible (thumbnail/og:image)
+    if media_url:
         try:
+            # Caption length is limited, keep it safe
+            caption = body
+            if len(caption) > 1000:
+                caption = caption[:1000].rstrip() + "..."
             await bot.send_photo(
                 chat_id=chat_id,
-                message_thread_id=thread_id,
-                photo=img,
+                message_thread_id=thread,
+                photo=media_url,
                 caption=caption,
                 parse_mode=ParseMode.HTML,
             )
@@ -336,251 +387,228 @@ async def send_update_media(bot, chat_id: int, thread_id: Optional[int], game: G
 
     await bot.send_message(
         chat_id=chat_id,
-        message_thread_id=thread_id,
-        text=caption,
+        message_thread_id=thread,
+        text=body if len(body) <= 4096 else (body[:4096].rstrip() + "..."),
         parse_mode=ParseMode.HTML,
-        disable_web_page_preview=False,
+        disable_web_page_preview=True,
     )
 
 
-# ----------------------------
-# Buttons UI (No Game List)
-# ----------------------------
-def panel_keyboard() -> InlineKeyboardMarkup:
+# ---------- Admin-only setup UI ----------
+def admin_panel_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Setup Topic / Channel", callback_data="panel:setup")],
-        [InlineKeyboardButton("🛠️ Latest Update / Patch", callback_data="panel:latest")],
-        [InlineKeyboardButton("🔔 Alerts ON / OFF", callback_data="panel:alerts")],
+        [InlineKeyboardButton("⚙️ Set Up Here (Topic/Channel)", callback_data="admin:setup")],
+        [InlineKeyboardButton("🔔 Alerts ON / OFF (Here)", callback_data="admin:toggle")],
+        [InlineKeyboardButton("🛠️ Send Latest Patch Now (Here)", callback_data="admin:sendnow")],
     ])
 
-def games_keyboard(prefix: str) -> InlineKeyboardMarkup:
+def games_kb(prefix: str) -> InlineKeyboardMarkup:
     rows = []
-    keys = list(GAMES.keys())
-    for i in range(0, len(keys), 2):
+    for i in range(0, len(VALID_GAMES), 2):
         row = []
-        for k in keys[i:i+2]:
-            row.append(InlineKeyboardButton(GAMES[k].name, callback_data=f"{prefix}:{k}"))
+        for k in VALID_GAMES[i:i+2]:
+            row.append(InlineKeyboardButton(GAME_NAMES[k], callback_data=f"{prefix}:{k}"))
         rows.append(row)
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="panel:back")])
+    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:back")])
     return InlineKeyboardMarkup(rows)
 
 
-# ----------------------------
-# /News command (members use this)
-# ----------------------------
+# ---------- /news ----------
 async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Works in private, groups, topics, channels (if bot gets updates)
-    if not update.effective_chat:
+    if not update.effective_chat or not update.effective_message:
         return
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        message_thread_id=update.effective_message.message_thread_id if update.effective_message and update.effective_message.is_topic_message else None,
-        text="📰 <b>Updates Panel</b>\nTap buttons below." + FOOTER,
-        parse_mode=ParseMode.HTML,
-        reply_markup=panel_keyboard(),
-    )
 
-    # auto-delete the /News message in groups/topics if bot has permission
+    chat_id, thread_id = ctx_ids(update)
+    user_id = update.effective_user.id if update.effective_user else 0
+
+    # delete user command if possible
     try:
-        if update.message and update.effective_chat.type in ("group", "supergroup"):
+        if update.message:
             await update.message.delete()
     except Exception:
         pass
 
+    # Admin sees setup panel (users never see it)
+    if is_admin(user_id):
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=None if thread_id == 0 else thread_id,
+            text="🔧 <b>Admin Panel</b>\n(Admin-only)" + FOOTER,
+            parse_mode=ParseMode.HTML,
+            reply_markup=admin_panel_kb(),
+        )
+        return
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # /start also opens same panel
-    await news_cmd(update, context)
+    # User: send latest patch for bound game only (no buttons)
+    bind = get_binding(chat_id, thread_id)
+    if not bind:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=None if thread_id == 0 else thread_id,
+            text="❌ This topic/channel is not configured yet." + FOOTER,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    game_key, enabled = bind
+    if enabled != 1:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=None if thread_id == 0 else thread_id,
+            text="🔕 Updates are OFF for this topic/channel." + FOOTER,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        return
+
+    try:
+        result = await fetch_latest_patch(game_key)
+        if not result:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                message_thread_id=None if thread_id == 0 else thread_id,
+                text="❌ Can't fetch updates right now. Try again later." + FOOTER,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+            return
+        media, title, desc, _uid = result
+        await send_patch(context.bot, chat_id, thread_id, game_key, media, title, desc)
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            message_thread_id=None if thread_id == 0 else thread_id,
+            text=f"❌ Error: {type(e).__name__}: {strip_links(str(e))}" + FOOTER,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
 
 
-# ----------------------------
-# Callbacks
-# ----------------------------
-def current_context_from_message(msg) -> Tuple[int, Optional[int]]:
-    """
-    Returns (chat_id, thread_id_or_none)
-    thread_id is used only for topics.
-    Channels do not have topics (thread_id None).
-    """
-    chat_id = msg.chat_id
-    thread_id = msg.message_thread_id if getattr(msg, "is_topic_message", False) else None
-    return chat_id, thread_id
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- Admin callbacks ----------
+async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q or not q.message:
+        return
+
+    user_id = q.from_user.id if q.from_user else 0
+    if not is_admin(user_id):
+        await q.answer("Admins only.", show_alert=True)
         return
 
     await q.answer()
     data = q.data or ""
     msg = q.message
-    chat_id, thread_id = current_context_from_message(msg)
 
-    if data == "panel:back":
-        await q.edit_message_reply_markup(reply_markup=panel_keyboard())
+    chat_id = msg.chat_id
+    thread_id = msg.message_thread_id if getattr(msg, "is_topic_message", False) else 0
+
+    if data == "admin:back":
+        await q.edit_message_reply_markup(reply_markup=admin_panel_kb())
         return
 
-    if data == "panel:setup":
+    if data == "admin:setup":
         await q.edit_message_text(
-            "Select a game to bind here.\n\n"
-            "✅ If you run /News inside a Topic, it binds THAT topic.\n"
-            "✅ If you run /News inside a Channel, it binds THAT channel.\n"
-            + FOOTER,
+            "Select game to bind here (Topic/Channel):" + FOOTER,
             parse_mode=ParseMode.HTML,
-            reply_markup=games_keyboard("setup"),
+            reply_markup=games_kb("bind"),
         )
         return
 
-    if data == "panel:latest":
-        await q.edit_message_text(
-            "Pick a game to send the latest Update / Patch:\n" + FOOTER,
-            parse_mode=ParseMode.HTML,
-            reply_markup=games_keyboard("latest"),
-        )
-        return
-
-    if data == "panel:alerts":
-        await q.edit_message_text(
-            "Pick a game to toggle alerts for THIS place (topic/channel):\n" + FOOTER,
-            parse_mode=ParseMode.HTML,
-            reply_markup=games_keyboard("toggle"),
-        )
-        return
-
-    # Setup binding
-    if data.startswith("setup:"):
-        game_key = data.split(":", 1)[1]
-        if game_key not in GAMES:
-            await q.edit_message_text("Unknown game." + FOOTER, reply_markup=panel_keyboard())
+    if data == "admin:toggle":
+        b = get_binding(chat_id, thread_id)
+        if not b:
+            await q.edit_message_text("❌ Not configured yet. Use Set Up first." + FOOTER,
+                                      parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
             return
-
-        # Use thread_id if topic, else 0 for "no topic"
-        bind_thread_id = thread_id if thread_id is not None else 0
-        set_topic_binding(game_key, chat_id, bind_thread_id, enabled=1)
-
+        new_enabled = toggle_enabled(chat_id, thread_id)
         await q.edit_message_text(
-            f"✅ Bound here to:\n<b>{escape_html(GAMES[game_key].name)}</b>\nAlerts: <b>ON</b>{FOOTER}",
+            f"🔔 Alerts now: <b>{'ON' if new_enabled == 1 else 'OFF'}</b>" + FOOTER,
             parse_mode=ParseMode.HTML,
-            reply_markup=panel_keyboard(),
+            reply_markup=admin_panel_kb(),
         )
         return
 
-    # Latest on demand
-    if data.startswith("latest:"):
-        game_key = data.split(":", 1)[1]
-        if game_key not in GAMES:
-            await q.edit_message_text("Unknown game." + FOOTER, reply_markup=panel_keyboard())
+    if data == "admin:sendnow":
+        b = get_binding(chat_id, thread_id)
+        if not b:
+            await q.edit_message_text("❌ Not configured yet. Use Set Up first." + FOOTER,
+                                      parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
             return
-
-        game = GAMES[game_key]
-        await q.edit_message_text(f"⏳ Fetching latest update/patch for <b>{escape_html(game.name)}</b>...{FOOTER}",
-                                  parse_mode=ParseMode.HTML)
-
+        game_key, _enabled = b
+        await q.edit_message_text("⏳ Fetching latest patch..." + FOOTER, parse_mode=ParseMode.HTML)
         try:
-            latest = await fetch_latest_patchlike(game)
-            if not latest:
-                await q.edit_message_text("Couldn't find a latest update/patch (site layout may have changed)." + FOOTER,
-                                          reply_markup=panel_keyboard())
+            result = await fetch_latest_patch(game_key)
+            if not result:
+                await q.edit_message_text("❌ Could not find update/patch right now." + FOOTER,
+                                          parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
                 return
-
-            title, url, img, desc = latest
-
-            send_thread_id = thread_id  # None for channels, topic id for topics
-            await send_update_media(context.bot, chat_id, send_thread_id, game, title, url, img, desc)
-
-            await q.edit_message_text("✅ Sent. Tap another option:" + FOOTER, parse_mode=ParseMode.HTML,
-                                      reply_markup=panel_keyboard())
-        except httpx.HTTPStatusError as e:
-            await q.edit_message_text(
-                f"❌ HTTP {e.response.status_code}\nSource: {escape_html(game.url)}{FOOTER}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=panel_keyboard(),
-            )
-        except httpx.RequestError as e:
-            await q.edit_message_text(
-                f"❌ Network error\nSource: {escape_html(game.url)}\n{escape_html(str(e))}{FOOTER}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=panel_keyboard(),
-            )
+            media, title, desc, _uid = result
+            await send_patch(context.bot, chat_id, thread_id, game_key, media, title, desc)
+            await q.edit_message_text("✅ Sent." + FOOTER, parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
         except Exception as e:
-            await q.edit_message_text(
-                f"❌ Error: {escape_html(type(e).__name__)}: {escape_html(str(e))}{FOOTER}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=panel_keyboard(),
-            )
+            await q.edit_message_text(f"❌ Error: {type(e).__name__}: {strip_links(str(e))}" + FOOTER,
+                                      parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
         return
 
-    # Toggle alerts
-    if data.startswith("toggle:"):
+    if data.startswith("bind:"):
         game_key = data.split(":", 1)[1]
-        if game_key not in GAMES:
-            await q.edit_message_text("Unknown game." + FOOTER, reply_markup=panel_keyboard())
+        if game_key not in VALID_GAMES:
+            await q.edit_message_text("Unknown game." + FOOTER, parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
             return
-
-        bind_thread_id = thread_id if thread_id is not None else 0
-        current = get_binding(game_key, chat_id, bind_thread_id)
-        new_enabled = 0 if current == 1 else 1
-        set_topic_binding(game_key, chat_id, bind_thread_id, enabled=new_enabled)
-
+        set_binding(chat_id, thread_id, game_key, enabled=1)
         await q.edit_message_text(
-            f"🔔 Alerts for <b>{escape_html(GAMES[game_key].name)}</b> here: "
-            f"<b>{'ON' if new_enabled else 'OFF'}</b>{FOOTER}",
+            f"✅ Bound here to:\n<b>{GAME_NAMES[game_key]}</b>\nAlerts: <b>ON</b>" + FOOTER,
             parse_mode=ParseMode.HTML,
-            reply_markup=panel_keyboard(),
+            reply_markup=admin_panel_kb(),
         )
         return
 
 
-# ----------------------------
-# Background job: posts new patch/update automatically
-# ----------------------------
-async def check_all_job(context: ContextTypes.DEFAULT_TYPE):
+# ---------- Auto checker ----------
+async def check_job(context: ContextTypes.DEFAULT_TYPE):
     app = context.application
-    print("[JOB] check cycle", time.strftime("%Y-%m-%d %H:%M:%S"))
+    binds = all_bindings()
+    if not binds:
+        return
 
-    for game_key, game in GAMES.items():
+    # Only check games that are actually bound somewhere
+    used_games = sorted(set(g for _, _, g, en in binds if en == 1 and g in VALID_GAMES))
+    for game_key in used_games:
         try:
-            latest = await fetch_latest_patchlike(game)
-            if not latest:
+            result = await fetch_latest_patch(game_key)
+            if not result:
                 continue
-            title, url, img, desc = latest
+            media, title, desc, uid = result
 
-            last_url = get_last_seen(game_key)
-
-            # baseline store (no spam on first run)
-            if not last_url:
-                update_last_seen(game_key, title, url)
+            last = get_last_seen(game_key)
+            if not last:
+                set_last_seen(game_key, uid, title)
                 continue
 
-            if url != last_url:
-                update_last_seen(game_key, title, url)
-
-                targets = get_bound_targets(game_key)
-                for chat_id, thread_id, enabled in targets:
-                    if not enabled:
+            if uid != last:
+                set_last_seen(game_key, uid, title)
+                # send to every place bound to this game
+                for chat_id, thread_id, g, enabled in binds:
+                    if enabled != 1 or g != game_key:
                         continue
-                    # thread_id=0 means "not a topic" (channel or normal group)
-                    send_thread = None if thread_id == 0 else thread_id
-                    await send_update_media(app.bot, chat_id, send_thread, game, title, url, img, desc)
+                    await send_patch(app.bot, chat_id, thread_id, game_key, media, title, desc)
 
         except Exception as e:
             print(f"[WARN] {game_key} check failed:", repr(e))
 
 
-# ----------------------------
-# Main
-# ----------------------------
 def main():
     init_db()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Members use /News
+    # Users: /news
     app.add_handler(CommandHandler(["news", "News"], news_cmd))
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CallbackQueryHandler(callback_handler))
+    app.add_handler(CallbackQueryHandler(cb))
 
-    app.job_queue.run_repeating(check_all_job, interval=CHECK_EVERY_MIN * 60, first=10)
+    # Auto checking
+    app.job_queue.run_repeating(check_job, interval=CHECK_EVERY_MIN * 60, first=10)
 
     print("Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
