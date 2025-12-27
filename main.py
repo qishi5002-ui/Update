@@ -1,67 +1,35 @@
-import os, re, time, sqlite3, asyncio
-from dataclasses import dataclass
-from typing import Optional, Dict, Tuple, List
-from xml.etree import ElementTree as ET
+import os
+import time
+import sqlite3
+from typing import Optional, Dict, Any, Tuple
 
-import httpx
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHECK_EVERY_MIN = int(os.getenv("CHECK_EVERY_MIN", "10"))
-DB_FILE = "updates_bot.db"
+OWNER_ID = int(os.getenv("OWNER_ID", "0"))
+DB_FILE = os.getenv("DB_FILE", "submission_bot.db").strip()
 
-FOOTER = "\n\nBot created by @RekkoOwn"
+INTRO_TEXT = "You can contact us using this bot.\n\nBot created by @GroupFeedBot"
 
 if not BOT_TOKEN:
     raise RuntimeError("Missing BOT_TOKEN")
+if OWNER_ID == 0:
+    raise RuntimeError("Missing OWNER_ID")
 
-PATCH_KEYWORDS = [
-    "patch", "patch notes", "update", "version", "hotfix", "bug fix", "bugfix",
-    "maintenance", "optimization", "optimisation", "season", "balance", "release notes",
-    "client update", "major update", "new version"
-]
 
-URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
-
-def strip_links(text: str) -> str:
-    if not text:
-        return ""
-    text = URL_RE.sub("", text)
-    text = re.sub(r"\s{2,}", " ", text).strip()
-    return text
-
-def has_patch_kw(s: str) -> bool:
-    t = (s or "").lower()
-    return any(k in t for k in PATCH_KEYWORDS)
-
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-async def http_get(url: str) -> httpx.Response:
-    last = None
-    for _ in range(3):
-        try:
-            async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=HEADERS) as client:
-                r = await client.get(url)
-                r.raise_for_status()
-                return r
-        except Exception as e:
-            last = e
-            await asyncio.sleep(2)
-    raise last
-
-# ---------------- DB ----------------
+# ---------------------- DB ----------------------
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_FILE)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -70,373 +38,452 @@ def db() -> sqlite3.Connection:
 def init_db():
     with db() as conn:
         conn.execute("""
-        CREATE TABLE IF NOT EXISTS bindings (
-            chat_id INTEGER NOT NULL,
-            thread_id INTEGER NOT NULL,
-            game_key TEXT NOT NULL,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY(chat_id, thread_id)
+        CREATE TABLE IF NOT EXISTS destinations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id INTEGER NOT NULL,
+            target_chat_id INTEGER NOT NULL,
+            target_thread_id INTEGER NOT NULL,   -- 0 = no topic
+            created_ts INTEGER NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(owner_id, target_chat_id, target_thread_id)
         )
         """)
         conn.execute("""
-        CREATE TABLE IF NOT EXISTS last_seen (
-            game_key TEXT PRIMARY KEY,
-            last_id TEXT,
-            last_title TEXT,
-            last_ts INTEGER
+        CREATE TABLE IF NOT EXISTS submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,          -- text | photo | video
+            file_id TEXT,                -- for photo/video
+            text TEXT,                   -- text or caption
+            status TEXT NOT NULL DEFAULT 'pending', -- pending/approved/rejected
+            created_ts INTEGER NOT NULL
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS admin_map (
+            owner_id INTEGER NOT NULL,
+            admin_msg_id INTEGER NOT NULL,
+            submission_id INTEGER NOT NULL,
+            PRIMARY KEY(owner_id, admin_msg_id)
+        )
+        """)
+        conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_intro (
+            user_id INTEGER PRIMARY KEY,
+            shown INTEGER NOT NULL DEFAULT 1
         )
         """)
 
-def ctx_ids(update: Update) -> Tuple[int, int]:
-    chat_id = update.effective_chat.id
-    msg = update.effective_message
-    if msg and getattr(msg, "is_topic_message", False) and msg.message_thread_id:
-        return chat_id, int(msg.message_thread_id)
-    return chat_id, 0
-
-def set_binding(chat_id: int, thread_id: int, game_key: str, enabled: int = 1):
+def upsert_destination(owner_id: int, target_chat_id: int, target_thread_id: int):
     with db() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO bindings(chat_id, thread_id, game_key, enabled) VALUES (?,?,?,?)",
-            (chat_id, thread_id, game_key, enabled)
-        )
+        conn.execute("""
+        INSERT OR IGNORE INTO destinations(owner_id, target_chat_id, target_thread_id, created_ts, active)
+        VALUES (?,?,?,?,1)
+        """, (owner_id, target_chat_id, target_thread_id, int(time.time())))
+        conn.execute("""
+        UPDATE destinations SET active=1 WHERE owner_id=? AND target_chat_id=? AND target_thread_id=?
+        """, (owner_id, target_chat_id, target_thread_id))
 
-def get_binding(chat_id: int, thread_id: int) -> Optional[Tuple[str, int]]:
+def list_destinations(owner_id: int) -> list[Tuple[int, int]]:
+    with db() as conn:
+        rows = conn.execute("""
+        SELECT target_chat_id, target_thread_id FROM destinations
+        WHERE owner_id=? AND active=1
+        ORDER BY id ASC
+        """, (owner_id,)).fetchall()
+    return [(int(r[0]), int(r[1])) for r in rows]
+
+def create_submission(user_id: int, kind: str, file_id: Optional[str], text: str) -> int:
+    with db() as conn:
+        cur = conn.execute(
+            "INSERT INTO submissions(user_id, kind, file_id, text, status, created_ts) "
+            "VALUES (?,?,?,?, 'pending', ?)",
+            (user_id, kind, file_id, text or "", int(time.time()))
+        )
+        return int(cur.lastrowid)
+
+def get_submission(sub_id: int) -> Optional[Dict[str, Any]]:
     with db() as conn:
         row = conn.execute(
-            "SELECT game_key, enabled FROM bindings WHERE chat_id=? AND thread_id=?",
-            (chat_id, thread_id)
+            "SELECT id, user_id, kind, file_id, text, status FROM submissions WHERE id=?",
+            (sub_id,)
         ).fetchone()
     if not row:
         return None
-    return str(row[0]), int(row[1])
+    return {
+        "id": int(row[0]),
+        "user_id": int(row[1]),
+        "kind": row[2],
+        "file_id": row[3],
+        "text": row[4] or "",
+        "status": row[5],
+    }
 
-def toggle_enabled(chat_id: int, thread_id: int) -> Optional[int]:
-    cur = get_binding(chat_id, thread_id)
-    if not cur:
-        return None
-    g, enabled = cur
-    new_enabled = 0 if enabled == 1 else 1
-    set_binding(chat_id, thread_id, g, new_enabled)
-    return new_enabled
-
-def all_bindings() -> List[Tuple[int, int, str, int]]:
+def set_submission_status(sub_id: int, status: str):
     with db() as conn:
-        rows = conn.execute("SELECT chat_id, thread_id, game_key, enabled FROM bindings").fetchall()
-    return [(int(r[0]), int(r[1]), str(r[2]), int(r[3])) for r in rows]
+        conn.execute("UPDATE submissions SET status=? WHERE id=?", (status, sub_id))
 
-def get_last_seen(game_key: str) -> Optional[str]:
-    with db() as conn:
-        row = conn.execute("SELECT last_id FROM last_seen WHERE game_key=?", (game_key,)).fetchone()
-    return row[0] if row else None
-
-def set_last_seen(game_key: str, item_id: str, title: str):
+def map_admin_message(owner_id: int, admin_msg_id: int, submission_id: int):
     with db() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO last_seen(game_key, last_id, last_title, last_ts) VALUES (?,?,?,?)",
-            (game_key, item_id, title, int(time.time()))
+            "INSERT OR REPLACE INTO admin_map(owner_id, admin_msg_id, submission_id) VALUES (?,?,?)",
+            (owner_id, admin_msg_id, submission_id)
         )
 
-# ---------------- Admin check (NOT hardcoded to you) ----------------
-async def is_chat_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    chat = update.effective_chat
-    user = update.effective_user
-    if not chat or not user:
-        return False
+def submission_from_admin_reply(owner_id: int, replied_msg_id: int) -> Optional[int]:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT submission_id FROM admin_map WHERE owner_id=? AND admin_msg_id=?",
+            (owner_id, replied_msg_id)
+        ).fetchone()
+    return int(row[0]) if row else None
+
+def intro_shown(user_id: int) -> bool:
+    with db() as conn:
+        row = conn.execute("SELECT 1 FROM user_intro WHERE user_id=?", (user_id,)).fetchone()
+    return bool(row)
+
+def mark_intro_shown(user_id: int):
+    with db() as conn:
+        conn.execute("INSERT OR REPLACE INTO user_intro(user_id, shown) VALUES (?,1)", (user_id,))
+
+
+# ---------------------- Helpers ----------------------
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+async def is_chat_admin(chat_id: int, user_id: int, bot) -> bool:
     try:
-        member = await context.bot.get_chat_member(chat.id, user.id)
+        member = await bot.get_chat_member(chat_id, user_id)
         return member.status in ("administrator", "creator")
     except Exception:
         return False
 
-# ---------------- Sources ----------------
-@dataclass
-class WebSource:
-    url: str
-    base: str
-    link_regex: re.Pattern
+def get_thread_id(update: Update) -> int:
+    msg = update.effective_message
+    if msg and getattr(msg, "is_topic_message", False) and msg.message_thread_id:
+        return int(msg.message_thread_id)
+    return 0
 
-@dataclass
-class YTSource:
-    channel_id: str  # YouTube channel id
-
-SOURCES: Dict[str, object] = {
-    # Official channel IDs (from YouTube channel pages)
-    "mlbb": YTSource(channel_id="UCqmld-BIYME2i_ooRTo1EOg"),        # Mobile Legends: Bang Bang  [oai_citation:0‡YouTube](https://www.youtube.com/channel/UCqmld-BIYME2i_ooRTo1EOg?utm_source=chatgpt.com)
-    "delta": YTSource(channel_id="UC82GZluB0OeupPB4FNUuYEg"),       # Garena Delta Force SG/MY/PH  [oai_citation:1‡YouTube](https://www.youtube.com/channel/UC82GZluB0OeupPB4FNUuYEg?utm_source=chatgpt.com)
-    "arena": YTSource(channel_id="UCSrq2wtp-DB6blBl4dRuzbw"),       # Arena Breakout  [oai_citation:2‡YouTube](https://www.youtube.com/channel/UCSrq2wtp-DB6blBl4dRuzbw?utm_source=chatgpt.com)
-    "freefire": YTSource(channel_id="UC7qTEluetD2pDB7lUBBlKuw"),    # Garena Free Fire Global  [oai_citation:3‡YouTube](https://www.youtube.com/channel/UC7qTEluetD2pDB7lUBBlKuw?utm_source=chatgpt.com)
-    "bloodstrike": YTSource(channel_id="UCqAKRVWkOrBNFcBD6I21CKw"), # Blood Strike Official  [oai_citation:4‡YouTube](https://www.youtube.com/channel/UCqAKRVWkOrBNFcBD6I21CKw?utm_source=chatgpt.com)
-
-    # If you want CODM later (blog scraping), we can add it back.
-}
-
-GAME_NAMES = {
-    "mlbb": "Mobile Legends: Bang Bang",
-    "delta": "Delta Force Mobile",
-    "arena": "Arena Breakout Mobile",
-    "freefire": "Free Fire",
-    "bloodstrike": "BloodStrike",
-}
-
-VALID_GAMES = list(GAME_NAMES.keys())
-
-def yt_feed_url(channel_id: str) -> str:
-    return f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-
-# ---------------- Fetch latest patch/update from YouTube RSS ----------------
-def parse_youtube_rss(xml_text: str) -> List[Tuple[str, str, str]]:
-    """
-    Returns list of (video_id, title, description) newest-first
-    """
-    ns = {
-        "atom": "http://www.w3.org/2005/Atom",
-        "yt": "http://www.youtube.com/xml/schemas/2015",
-        "media": "http://search.yahoo.com/mrss/",
-    }
-    root = ET.fromstring(xml_text)
-    out = []
-    for entry in root.findall("atom:entry", ns):
-        vid = entry.findtext("yt:videoId", default="", namespaces=ns).strip()
-        title = entry.findtext("atom:title", default="", namespaces=ns).strip()
-        desc = entry.findtext("media:group/media:description", default="", namespaces=ns).strip()
-        out.append((vid, title, desc))
-    return out
-
-async def fetch_latest_patch(game_key: str) -> Optional[Tuple[Optional[str], str, str, str]]:
-    src = SOURCES[game_key]
-    if isinstance(src, YTSource):
-        r = await http_get(yt_feed_url(src.channel_id))
-        entries = parse_youtube_rss(r.text)
-        if not entries:
-            return None
-
-        # Prefer patch/update-like titles first
-        patch_first = [e for e in entries if has_patch_kw(e[1])]
-        vid, title, desc = patch_first[0] if patch_first else entries[0]
-
-        # Thumbnail (media)
-        thumb = f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg" if vid else None
-
-        title = strip_links(title)
-        desc = strip_links(desc)
-
-        # Make description “full” but safe for Telegram
-        if len(desc) > 1200:
-            desc = desc[:1200].rstrip() + "..."
-
-        unique_id = vid or title
-        return thumb, title, desc, unique_id
-
-    return None
-
-# ---------------- Send (NO LINKS) ----------------
-async def send_patch(bot, chat_id: int, thread_id: int, game_key: str,
-                     media_url: Optional[str], title: str, desc: str):
-    thread = None if thread_id == 0 else thread_id
-    game_name = GAME_NAMES[game_key]
-
-    body = f"🛠️ <b>{game_name} — Update / Patch</b>\n<b>{strip_links(title)}</b>"
-    if desc:
-        body += f"\n\n{strip_links(desc)}"
-    body += f"{FOOTER}"
-
-    if media_url:
-        try:
-            caption = body
-            if len(caption) > 1000:
-                caption = caption[:1000].rstrip() + "..."
-            await bot.send_photo(
-                chat_id=chat_id,
-                message_thread_id=thread,
-                photo=media_url,
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        except Exception:
-            pass
-
-    await bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=thread,
-        text=body if len(body) <= 4096 else (body[:4096].rstrip() + "..."),
-        parse_mode=ParseMode.HTML,
-        disable_web_page_preview=True,
-    )
-
-# ---------------- Admin-only UI ----------------
-def admin_panel_kb() -> InlineKeyboardMarkup:
+def approve_kb(sub_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚙️ Set Up Here (Topic/Channel)", callback_data="admin:setup")],
-        [InlineKeyboardButton("🔔 Alerts ON / OFF (Here)", callback_data="admin:toggle")],
-        [InlineKeyboardButton("🛠️ Send Latest Patch Now (Here)", callback_data="admin:sendnow")],
+        [
+            InlineKeyboardButton("✅ Approve", callback_data=f"approve:{sub_id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject:{sub_id}"),
+        ]
     ])
 
-def games_kb(prefix: str) -> InlineKeyboardMarkup:
-    rows = []
-    for i in range(0, len(VALID_GAMES), 2):
-        row = []
-        for k in VALID_GAMES[i:i+2]:
-            row.append(InlineKeyboardButton(GAME_NAMES[k], callback_data=f"{prefix}:{k}"))
-        rows.append(row)
-    rows.append([InlineKeyboardButton("⬅️ Back", callback_data="admin:back")])
-    return InlineKeyboardMarkup(rows)
+def safe_caption(text: str, limit: int = 950) -> str:
+    t = (text or "").strip()
+    if len(t) > limit:
+        t = t[:limit].rstrip() + "..."
+    return t
 
-# ---------------- /news (ADMIN ONLY) ----------------
-async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or not update.effective_message:
+async def send_to_dest(bot, dest: Tuple[int, int], kind: str, file_id: Optional[str], text: str):
+    chat_id, thread_id = dest
+    kwargs = {}
+    if thread_id != 0:
+        kwargs["message_thread_id"] = thread_id
+
+    # IMPORTANT: no footer appended here (per your request)
+    if kind == "text":
+        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+    elif kind == "photo":
+        await bot.send_photo(chat_id=chat_id, photo=file_id, caption=safe_caption(text), **kwargs)
+    elif kind == "video":
+        await bot.send_video(chat_id=chat_id, video=file_id, caption=safe_caption(text), **kwargs)
+
+async def post_approved_to_all(context: ContextTypes.DEFAULT_TYPE, sub: Dict[str, Any]):
+    destinations = list_destinations(OWNER_ID)
+    if not destinations:
+        await context.bot.send_message(chat_id=OWNER_ID, text="❌ No destinations connected. Use /connect in a group/topic.")
         return
 
-    # delete command message if possible
+    content = (sub["text"] or "").strip()
+    out_text = content  # no footer
+
+    for dest in destinations:
+        try:
+            await send_to_dest(context.bot, dest, sub["kind"], sub["file_id"], out_text)
+        except Exception as e:
+            await context.bot.send_message(chat_id=OWNER_ID, text=f"❌ Failed posting to {dest}: {e}")
+
+async def broadcast_to_all(context: ContextTypes.DEFAULT_TYPE, kind: str, file_id: Optional[str], text: str):
+    destinations = list_destinations(OWNER_ID)
+    if not destinations:
+        await context.bot.send_message(chat_id=OWNER_ID, text="❌ No destinations connected. Use /connect in a group/topic.")
+        return
+
+    out_text = (text or "").strip()  # no footer
+    for dest in destinations:
+        try:
+            await send_to_dest(context.bot, dest, kind, file_id, out_text)
+        except Exception as e:
+            await context.bot.send_message(chat_id=OWNER_ID, text=f"❌ Failed broadcasting to {dest}: {e}")
+
+
+# ---------------------- Commands ----------------------
+async def connect_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Run /connect inside the target group/channel/topic to add it as a destination.
+    Only OWNER can connect.
+    """
+    if not update.effective_chat or not update.effective_user or not update.effective_message:
+        return
+
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if chat.type not in ("group", "supergroup", "channel"):
+        return
+
+    if not is_owner(user.id):
+        return
+
+    # must be admin in that chat to post
+    if not await is_chat_admin(chat.id, user.id, context.bot):
+        return
+
+    thread_id = get_thread_id(update)
+    upsert_destination(owner_id=OWNER_ID, target_chat_id=chat.id, target_thread_id=thread_id)
+
+    # delete /connect command if possible
     try:
         if update.message:
             await update.message.delete()
     except Exception:
         pass
 
-    if not await is_chat_admin(update, context):
-        # Don’t show anything to normal users
-        return
-
-    chat_id, thread_id = ctx_ids(update)
+    where = "this topic" if thread_id != 0 else "this chat"
     await context.bot.send_message(
-        chat_id=chat_id,
-        message_thread_id=None if thread_id == 0 else thread_id,
-        text="🔧 <b>Admin Panel</b>\n(Admins only)" + FOOTER,
-        parse_mode=ParseMode.HTML,
-        reply_markup=admin_panel_kb()
+        chat_id=chat.id,
+        message_thread_id=thread_id if thread_id != 0 else None,
+        text=f"✅ Connected to {where}."
     )
 
-# ---------------- Admin callbacks ----------------
-async def cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Only show intro message here (per your request)
+    if not update.message or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    uid = update.effective_user.id
+    if not intro_shown(uid):
+        mark_intro_shown(uid)
+        await update.message.reply_text(INTRO_TEXT)
+
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    OWNER in DM: reply to any message/photo/video with /broadcast to send it to all connected destinations.
+    """
+    if not update.message or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        return
+    if not is_owner(update.effective_user.id):
+        return
+
+    if not update.message.reply_to_message:
+        await update.message.reply_text("Reply to a message/photo/video with /broadcast")
+        return
+
+    src = update.message.reply_to_message
+
+    if src.text and not src.text.startswith("/"):
+        await broadcast_to_all(context, "text", None, src.text)
+        await update.message.reply_text("✅ Broadcast sent.")
+        return
+
+    if src.photo:
+        caption = src.caption or ""
+        await broadcast_to_all(context, "photo", src.photo[-1].file_id, caption)
+        await update.message.reply_text("✅ Broadcast sent.")
+        return
+
+    if src.video:
+        caption = src.caption or ""
+        await broadcast_to_all(context, "video", src.video.file_id, caption)
+        await update.message.reply_text("✅ Broadcast sent.")
+        return
+
+    await update.message.reply_text("Reply to a text/photo/video.")
+
+
+# ---------------------- User submissions (DM) ----------------------
+async def user_private_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        return
+
+    user_id = update.effective_user.id
+    msg = update.message
+
+    # Show intro only once, then stay silent forever (no other replies)
+    if not intro_shown(user_id):
+        mark_intro_shown(user_id)
+        await msg.reply_text(INTRO_TEXT)
+        # continue processing submission after showing intro once
+
+    # create submission and send to owner DM for approval
+    if msg.text and not msg.text.startswith("/"):
+        sub_id = create_submission(user_id=user_id, kind="text", file_id=None, text=msg.text)
+        sub = get_submission(sub_id)
+        header = f"📥 <b>Submission</b>\nID: <code>{sub_id}</code>\nType: <b>TEXT</b>"
+        sent = await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"{header}\n\n{sub['text']}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=approve_kb(sub_id)
+        )
+        map_admin_message(OWNER_ID, sent.message_id, sub_id)
+        return
+
+    if msg.photo:
+        file_id = msg.photo[-1].file_id
+        caption = msg.caption or ""
+        sub_id = create_submission(user_id=user_id, kind="photo", file_id=file_id, text=caption)
+        header = f"📥 <b>Submission</b>\nID: <code>{sub_id}</code>\nType: <b>PHOTO</b>"
+        sent = await context.bot.send_photo(
+            chat_id=OWNER_ID,
+            photo=file_id,
+            caption=f"{header}\n\n{caption}" if caption else header,
+            parse_mode=ParseMode.HTML,
+            reply_markup=approve_kb(sub_id)
+        )
+        map_admin_message(OWNER_ID, sent.message_id, sub_id)
+        return
+
+    if msg.video:
+        file_id = msg.video.file_id
+        caption = msg.caption or ""
+        sub_id = create_submission(user_id=user_id, kind="video", file_id=file_id, text=caption)
+        header = f"📥 <b>Submission</b>\nID: <code>{sub_id}</code>\nType: <b>VIDEO</b>"
+        sent = await context.bot.send_video(
+            chat_id=OWNER_ID,
+            video=file_id,
+            caption=f"{header}\n\n{caption}" if caption else header,
+            parse_mode=ParseMode.HTML,
+            reply_markup=approve_kb(sub_id)
+        )
+        map_admin_message(OWNER_ID, sent.message_id, sub_id)
+        return
+
+    # everything else ignored silently
+
+
+# ---------------------- Admin approve/reject ----------------------
+async def approve_reject_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not q.message:
+    if not q or not q.from_user:
         return
 
-    # Only admins of that chat can use buttons
-    # (Use the callback user + message chat to check.)
-    try:
-        member = await context.bot.get_chat_member(q.message.chat_id, q.from_user.id)
-        if member.status not in ("administrator", "creator"):
-            await q.answer("Admins only.", show_alert=True)
-            return
-    except Exception:
-        await q.answer("Admins only.", show_alert=True)
+    if q.from_user.id != OWNER_ID:
+        await q.answer("Owner only.", show_alert=True)
         return
 
-    await q.answer()
     data = q.data or ""
-    msg = q.message
-
-    chat_id = msg.chat_id
-    thread_id = msg.message_thread_id if getattr(msg, "is_topic_message", False) else 0
-
-    if data == "admin:back":
-        await q.edit_message_reply_markup(reply_markup=admin_panel_kb())
+    try:
+        action, sid = data.split(":", 1)
+        sub_id = int(sid)
+    except Exception:
+        await q.answer()
         return
 
-    if data == "admin:setup":
-        await q.edit_message_text(
-            "Select which game this Topic/Channel is for:" + FOOTER,
-            parse_mode=ParseMode.HTML,
-            reply_markup=games_kb("bind")
-        )
+    sub = get_submission(sub_id)
+    if not sub:
+        await q.answer("Not found.", show_alert=True)
+        return
+    if sub["status"] != "pending":
+        await q.answer(f"Already {sub['status']}.", show_alert=True)
         return
 
-    if data == "admin:toggle":
-        b = get_binding(chat_id, thread_id)
-        if not b:
-            await q.edit_message_text("❌ Not configured yet. Use Set Up first." + FOOTER,
-                                      parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
-            return
-        new_enabled = toggle_enabled(chat_id, thread_id)
-        await q.edit_message_text(
-            f"🔔 Alerts now: <b>{'ON' if new_enabled == 1 else 'OFF'}</b>" + FOOTER,
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_panel_kb()
-        )
-        return
-
-    if data == "admin:sendnow":
-        b = get_binding(chat_id, thread_id)
-        if not b:
-            await q.edit_message_text("❌ Not configured yet. Use Set Up first." + FOOTER,
-                                      parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
-            return
-        game_key, enabled = b
-        if enabled != 1:
-            await q.edit_message_text("🔕 Alerts are OFF here. Toggle ON first." + FOOTER,
-                                      parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
-            return
-
-        await q.edit_message_text("⏳ Fetching latest update/patch..." + FOOTER, parse_mode=ParseMode.HTML)
+    if action == "reject":
+        set_submission_status(sub_id, "rejected")
+        await q.answer("Rejected.")
         try:
-            result = await fetch_latest_patch(game_key)
-            if not result:
-                await q.edit_message_text("❌ Could not fetch update/patch right now." + FOOTER,
-                                          parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
-                return
-            media, title, desc, _uid = result
-            await send_patch(context.bot, chat_id, thread_id, game_key, media, title, desc)
-            await q.edit_message_text("✅ Sent." + FOOTER, parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
-        except Exception as e:
-            await q.edit_message_text(f"❌ Error: {type(e).__name__}: {strip_links(str(e))}" + FOOTER,
-                                      parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
         return
 
-    if data.startswith("bind:"):
-        game_key = data.split(":", 1)[1]
-        if game_key not in VALID_GAMES:
-            await q.edit_message_text("Unknown game." + FOOTER, parse_mode=ParseMode.HTML, reply_markup=admin_panel_kb())
-            return
-        set_binding(chat_id, thread_id, game_key, enabled=1)
-        await q.edit_message_text(
-            f"✅ Bound here to:\n<b>{GAME_NAMES[game_key]}</b>\nAlerts: <b>ON</b>" + FOOTER,
-            parse_mode=ParseMode.HTML,
-            reply_markup=admin_panel_kb()
-        )
-        return
-
-# ---------------- Auto checker ----------------
-async def check_job(context: ContextTypes.DEFAULT_TYPE):
-    app = context.application
-    binds = all_bindings()
-    if not binds:
-        return
-
-    used_games = sorted(set(g for _, _, g, en in binds if en == 1 and g in VALID_GAMES))
-    for game_key in used_games:
+    if action == "approve":
+        set_submission_status(sub_id, "approved")
+        await q.answer("Approved.")
         try:
-            result = await fetch_latest_patch(game_key)
-            if not result:
-                continue
-            media, title, desc, uid = result
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
 
-            last = get_last_seen(game_key)
-            if not last:
-                set_last_seen(game_key, uid, title)
-                continue
+        # post to all connected destinations (NO footer)
+        await post_approved_to_all(context, sub)
+        return
 
-            if uid != last:
-                set_last_seen(game_key, uid, title)
-                for chat_id, thread_id, g, enabled in binds:
-                    if enabled != 1 or g != game_key:
-                        continue
-                    await send_patch(app.bot, chat_id, thread_id, game_key, media, title, desc)
 
-        except Exception as e:
-            print(f"[WARN] {game_key} check failed:", repr(e))
+# ---------------------- Admin reply relay -> user ----------------------
+async def admin_reply_relay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    OWNER replies in DM to the bot's submission message -> bot relays reply to the original user.
+    """
+    msg = update.message
+    if not msg or not update.effective_user:
+        return
+    if update.effective_chat.type != "private":
+        return
+    if update.effective_user.id != OWNER_ID:
+        return
+
+    if not msg.reply_to_message:
+        return
+
+    sub_id = submission_from_admin_reply(OWNER_ID, msg.reply_to_message.message_id)
+    if not sub_id:
+        return
+
+    sub = get_submission(sub_id)
+    if not sub:
+        return
+
+    user_id = sub["user_id"]
+
+    # Relay admin reply (copy)
+    if msg.text and not msg.text.startswith("/"):
+        await context.bot.send_message(chat_id=user_id, text=msg.text)
+        return
+
+    if msg.photo:
+        cap = msg.caption or ""
+        await context.bot.send_photo(chat_id=user_id, photo=msg.photo[-1].file_id, caption=cap)
+        return
+
+    if msg.video:
+        cap = msg.caption or ""
+        await context.bot.send_video(chat_id=user_id, video=msg.video.file_id, caption=cap)
+        return
+
 
 def main():
     init_db()
-
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler(["news", "News"], news_cmd))
-    app.add_handler(CallbackQueryHandler(cb))
+    # Connect destinations
+    app.add_handler(CommandHandler("connect", connect_cmd))
 
-    app.job_queue.run_repeating(check_job, interval=CHECK_EVERY_MIN * 60, first=10)
+    # Intro
+    app.add_handler(CommandHandler("start", start_cmd))
+
+    # User submissions (private)
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.PHOTO | filters.VIDEO), user_private_handler))
+
+    # Owner broadcast
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+
+    # Approve/Reject
+    app.add_handler(CallbackQueryHandler(approve_reject_cb, pattern=r"^(approve|reject):\d+$"))
+
+    # Owner reply relay
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE & filters.REPLY & (filters.TEXT | filters.PHOTO | filters.VIDEO), admin_reply_relay))
 
     print("Bot running...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
